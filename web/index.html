@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>infinite morrowind</title>
+<link rel="icon" href="data:,">
+<style>
+  @font-face { font-family: "Comic Neue"; font-weight: 400; font-display: swap;
+    src: local("Comic Neue"), url(fonts/ComicNeue-Regular.woff2) format("woff2"); }
+  @font-face { font-family: "Comic Neue"; font-weight: 700; font-display: swap;
+    src: local("Comic Neue Bold"), url(fonts/ComicNeue-Bold.woff2) format("woff2"); }
+  :root {
+    --bg: #0f1115; --text: #e6e8ee; --muted: #8b93a7; --accent: #7aa2ff;
+    color-scheme: dark;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f6f7f9; --text: #1b1f27; --muted: #5f6878; --accent: #2f5fd0;
+      color-scheme: light;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font: 16px/1.55 "Comic Sans MS", "Comic Sans", "Comic Neue", cursive; }
+  a { color: var(--accent); text-decoration: underline; text-underline-offset: 3px; text-decoration-thickness: 1px; }
+  a:hover { text-decoration-thickness: 2px; }
+  .wrap { max-width: 640px; margin: 0 auto; padding: 48px 20px 80px; }
+  section { margin-bottom: 34px; }
+  h1 { margin: 0 0 8px; font-size: 30px; }
+  p { margin: 0; color: var(--muted); }
+  h2 { margin: 0 0 10px; font-size: 15px; color: var(--muted); font-weight: 700; }
+  .stats { font-size: 14px; margin-top: 8px; }
+  .btn { font: inherit; color: var(--accent); cursor: pointer; background: none;
+    border: 0; margin: 0; box-shadow: inset 0 0 0 1px var(--accent); border-radius: 2px; padding: 0 8px; }
+  .btn:disabled { opacity: .45; cursor: default; }
+  .row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; margin-bottom: 12px; }
+  textarea { width: 100%; font: inherit; color: var(--text); background: none; resize: vertical;
+    border: 0; box-shadow: inset 0 0 0 1px var(--muted); border-radius: 2px; padding: 6px 8px; }
+  label { color: var(--muted); font-size: 14px; display: flex; align-items: center; gap: 8px; }
+  input[type=range] { accent-color: var(--accent); width: 120px; }
+  output { color: var(--text); min-width: 3.5em; }
+  #output { white-space: pre-wrap; margin: 0; font: inherit; min-height: 12em; }
+  #output.error { color: #e5484d; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <section>
+    <h1>infinite morrowind</h1>
+    <p>a tiny char-rnn trained from scratch on all 440 books from morrowind, tribunal and bloodmoon. it runs right in your browser and writes endless fake lore</p>
+    <p class="stats">checkpoint <span id="iteration">...</span> · loss <span id="loss-ce">...</span> · <span id="vocab-size">...</span> chars · <a href="https://github.com/maxeozakh/infinite-morrowind" target="_blank" rel="noopener">code</a></p>
+  </section>
+
+  <section>
+    <h2>start with</h2>
+    <div class="row" id="presets"></div>
+    <textarea id="seed" rows="2"></textarea>
+  </section>
+
+  <section>
+    <div class="row">
+      <button class="btn" id="toggle" type="button">pause</button>
+      <button class="btn" id="reset" type="button">restart</button>
+      <label>temperature <input id="temperature" type="range" min="0.35" max="1.3" step="0.05" value="0.6"><output id="temperature-value"></output></label>
+      <label>delay <input id="char-delay" type="range" min="0" max="60" step="5" value="15"><output id="char-delay-value"></output></label>
+    </div>
+    <pre id="output" aria-live="polite"></pre>
+  </section>
+</div>
+
+<script src="model.js"></script>
+<script>
+(() => {
+  const model = window.SMOL_RNN_MODEL;
+  const PRESETS = [
+    "36 Lessons of Vivec, Sermon 37\n\n",
+    "Nerevar Moon-and-Star\n\n",
+    "The Blue Book of Riddles\n\n",
+    "\"Outlander,",
+  ];
+
+  const $ = (id) => document.getElementById(id);
+  const output = $("output");
+  const seedInput = $("seed");
+  const temperatureInput = $("temperature");
+  const charDelayInput = $("char-delay");
+  const toggleButton = $("toggle");
+
+  function decode(t) {
+    const bytes = Uint8Array.from(atob(t.b64), (c) => c.charCodeAt(0));
+    return { rows: t.rows, cols: t.cols, data: new Float32Array(bytes.buffer) };
+  }
+  const T = Object.fromEntries(Object.entries(model.tensors).map(([k, v]) => [k, decode(v)]));
+  const charToIx = new Map(model.chars.map((ch, i) => [ch, i]));
+
+  let h = null;
+  let ix = null;
+  let running = false;
+  let timer = null;
+
+  function rnnStep(inputIx) {
+    const { E, Wxh, Whh, bh, Why, by } = T;
+    const nextH = new Float32Array(Whh.rows);
+    for (let r = 0; r < Whh.rows; r += 1) {
+      let sum = bh.data[r];
+      const wxhOffset = r * Wxh.cols;
+      for (let c = 0; c < Wxh.cols; c += 1) sum += Wxh.data[wxhOffset + c] * E.data[c * E.cols + inputIx];
+      const whhOffset = r * Whh.cols;
+      for (let c = 0; c < Whh.cols; c += 1) sum += Whh.data[whhOffset + c] * h[c];
+      nextH[r] = Math.tanh(sum);
+    }
+    h = nextH;
+    const logits = new Float32Array(Why.rows);
+    for (let r = 0; r < Why.rows; r += 1) {
+      let sum = by.data[r];
+      const offset = r * Why.cols;
+      for (let c = 0; c < Why.cols; c += 1) sum += Why.data[offset + c] * h[c];
+      logits[r] = sum;
+    }
+    return logits;
+  }
+
+  function sample(logits, temperature) {
+    let max = -Infinity;
+    for (const v of logits) max = Math.max(max, v / temperature);
+    const probs = logits.map((v) => Math.exp(v / temperature - max));
+    let threshold = Math.random() * probs.reduce((a, b) => a + b, 0);
+    for (let i = 0; i < probs.length; i += 1) {
+      threshold -= probs[i];
+      if (threshold <= 0) return i;
+    }
+    return probs.length - 1;
+  }
+
+  function prepareSeed(seed) {
+    const missing = [...new Set(seed)].filter((ch) => !charToIx.has(ch));
+    if (missing.length > 0) throw new Error(`the model doesn't know these chars: ${missing.join(" ")}`);
+    // checkpoint hidden state already "remembers" being mid-book, so text starts more fluent than from zeros
+    h = new Float32Array(T.hprev.data);
+    ix = charToIx.get(seed[0]);
+    for (const ch of seed.slice(1)) {
+      rnnStep(ix);
+      ix = charToIx.get(ch);
+    }
+    output.classList.remove("error");
+    output.textContent = seed;
+  }
+
+  function tick() {
+    if (!running) return;
+    ix = sample(rnnStep(ix), Number(temperatureInput.value));
+    output.textContent += model.chars[ix];
+    timer = setTimeout(tick, Number(charDelayInput.value));
+  }
+
+  function start() {
+    if (h === null) {
+      try {
+        prepareSeed(seedInput.value || PRESETS[0]);
+      } catch (error) {
+        output.classList.add("error");
+        output.textContent = error.message;
+        return;
+      }
+    }
+    running = true;
+    toggleButton.textContent = "pause";
+    tick();
+  }
+
+  function pause() {
+    running = false;
+    toggleButton.textContent = "continue";
+    clearTimeout(timer);
+  }
+
+  function restart() {
+    pause();
+    h = null;
+    start();
+  }
+
+  function syncControls() {
+    $("temperature-value").value = Number(temperatureInput.value).toFixed(2);
+    $("char-delay-value").value = `${charDelayInput.value}ms`;
+  }
+
+  PRESETS.forEach((seed) => {
+    const button = document.createElement("button");
+    button.className = "btn";
+    button.type = "button";
+    button.textContent = seed.trim().toLowerCase();
+    button.addEventListener("click", () => {
+      seedInput.value = seed;
+      restart();
+    });
+    $("presets").append(button);
+  });
+
+  $("iteration").textContent = model.iteration.toLocaleString("en");
+  $("loss-ce").textContent = model.lossCe.toFixed(2);
+  $("vocab-size").textContent = model.chars.length;
+  seedInput.value = PRESETS[0];
+
+  toggleButton.addEventListener("click", () => (running ? pause() : start()));
+  $("reset").addEventListener("click", restart);
+  seedInput.addEventListener("input", () => { pause(); h = null; toggleButton.textContent = "start"; });
+  temperatureInput.addEventListener("input", syncControls);
+  charDelayInput.addEventListener("input", syncControls);
+
+  syncControls();
+  start();
+})();
+</script>
+</body>
+</html>
